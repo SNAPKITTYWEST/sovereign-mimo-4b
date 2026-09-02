@@ -1,0 +1,59 @@
+# Sovereign MiMo-4B Training Configuration
+# Reward model fine-tuning after pruning
+
+model:
+  name: sovereign-mimo-4b
+  d_model: 2048
+  n_layers: 24
+  n_heads: 16
+  n_kv_heads: 4
+  d_ff: 5504
+  vocab_size: 32000
+  max_seq_len: 8192
+  reward_head: scalar
+
+training:
+  # Phase 1: Reward model fine-tuning
+  batch_size: 8
+  micro_batch_size: 2
+  gradient_accumulation_steps: 4
+  learning_rate: 1.0e-5
+  min_learning_rate: 1.0e-6
+  warmup_steps: 100
+  total_steps: 5000
+  weight_decay: 0.01
+  grad_clip: 1.0
+  optimizer: adamw
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_eps: 1.0e-8
+  lr_scheduler: cosine
+  precision: bf16
+
+  # Reward-specific
+  reward_loss: mse
+  reward_range: [0.0, 1.0]
+  label_smoothing: 0.05
+
+data:
+  # Code quality signals
+  sources:
+    - name: code-quality
+      description: "Code snippets with quality scores (test pass, complexity, style)"
+    - name: code-review
+      description: "Human code review scores"
+    - name: synthetic
+      description: "Generated code with automatic quality metrics"
+
+  tokenizer:
+    type: instructbert
+    vocab_size: 30522
+    max_length: 512
+
+hardware:
+  # BBQBADDIE: RTX 3080 (10GB)
+  gpus: 1
+  gpu_type: rtx_3080_10gb
+  batch_size: 8
+  gradient_checkpointing: true
+  flash_attention: true

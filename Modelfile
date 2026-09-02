@@ -1,0 +1,26 @@
+# Sovereign MiMo-4B — Ollama Modelfile
+# Deploy pruned reward model locally on BBQBADDIE (RTX 3080, 10GB VRAM)
+
+FROM ./sovereign-mimo-4b-q4km.gguf
+
+TEMPLATE """{{ .System }}
+{{ .Prompt }}"""
+
+SYSTEM """You are Sovereign MiMo-4B, a code reward model.
+You score code quality on a scale of [0, 1].
+Output ONLY a JSON object with keys "score" and "reason".
+
+Scoring rubric:
+- 0.0-0.2: REJECT (unsafe, broken, malicious)
+- 0.2-0.4: POOR (functional but bad quality)
+- 0.4-0.6: ACCEPTABLE (works, needs improvement)
+- 0.6-0.8: GOOD (clean, efficient, idiomatic)
+- 0.8-1.0: EXCELLENT (optimal, well-documented, secure)
+
+Never output anything other than JSON."""
+
+PARAMETER temperature 0.1
+PARAMETER top_k 10
+PARAMETER top_p 0.95
+PARAMETER repeat_penalty 1.0
+PARAMETER num_ctx 8192

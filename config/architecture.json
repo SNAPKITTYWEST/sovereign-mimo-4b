@@ -1,0 +1,82 @@
+{
+  "model_name": "Sovereign-MiMo-4B",
+  "model_family": "mimo-4b",
+  "version": "1.0",
+  "origin": "pruned from MiMo-7B-RL (XiaomiMiMo)",
+  "target_architecture": "hilbert-4b",
+
+  "architecture": {
+    "type": "decoder-only-transformer",
+    "norm": "rmsnorm",
+    "activation": "swiglu",
+    "position_encoding": "rope",
+    "attention": "grouped-query"
+  },
+
+  "dimensions": {
+    "d_model": 2048,
+    "n_layers": 24,
+    "n_heads": 16,
+    "n_kv_heads": 4,
+    "head_dim": 128,
+    "d_ff": 5504,
+    "vocab_size": 32000,
+    "max_seq_len": 8192
+  },
+
+  "rope": {
+    "theta": 10000.0,
+    "dimension_count": 128,
+    "scaling_type": "linear",
+    "scaling_factor": 2.0,
+    "original_context_length": 4096
+  },
+
+  "norm": {
+    "type": "rmsnorm",
+    "epsilon": 1e-5
+  },
+
+  "reward_head": {
+    "type": "scalar",
+    "hidden_size": 2048,
+    "output_size": 1,
+    "activation": "tanh",
+    "description": "Scalar reward score [0, 1] for code quality"
+  },
+
+  "tokenizer": {
+    "type": "instructbert",
+    "vocab_size": 30522,
+    "max_length": 512,
+    "padding": "max_length",
+    "truncation": true,
+    "note": "InstructBERT encodings replace standard BPE"
+  },
+
+  "quantization": {
+    "training": "bf16",
+    "deployment": "Q4_K_M",
+    "embeddings": "Q8_0",
+    "norms": "F32"
+  },
+
+  "parameters": {
+    "total_estimate": "~4B",
+    "embedding_params": "62586880",
+    "per_layer_params": "~150M",
+    "reward_head_params": "4097"
+  },
+
+  "pruning": {
+    "source": "XiaomiMiMo/MiMo-7B-RL",
+    "source_layers": 32,
+    "source_hidden": 4096,
+    "source_heads": 32,
+    "source_kv_heads": 8,
+    "source_ff": 11008,
+    "strategy": "layer-selection + weight-projection + distillation",
+    "layers_kept": "0,1,2,3,4,5,6,7,8,9,10,11,13,14,15,16,17,18,19,20,21,22,23,24",
+    "layers_pruned": "12,25,26,27,28,29,30,31"
+  }
+}
