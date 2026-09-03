@@ -4,6 +4,8 @@
 [![Params](https://img.shields.io/badge/Params-~4B-orange.svg)](config/architecture.json)
 [![GPU](https://img.shields.io/badge/GPU-RTX%203080%2010GB-76b900.svg)](#hardware)
 [![QRA](https://img.shields.io/badge/QRA-H--0%20Deterministic-blue.svg)](#qra-routing)
+[![WMMA](https://img.shields.io/badge/WMMA-FP16%20Tensor%20Core-sm__86-purple.svg)](#kimi-k3-nano)
+[![Speculative](https://img.shields.io/badge/Speculative-Decoding-gamma--4-green.svg)](#kimi-k3-nano)
 [![Ollama](https://img.shields.io/badge/Deploy-Ollama%20Local-000000.svg)](#deploy)
 [![ERE](https://img.shields.io/badge/ERE-P1--P5%20Gates-red.svg)](#ere-gates)
 
@@ -248,7 +250,102 @@ sovereign-mimo-4b/
 │   └── prune_mimo7b_to_4b.py  # MiMo-7B → 4B pipeline
 ├── Modelfile                # Ollama deployment
 ├── MODEL_CARD.md            # Model card
+├── k3_nano/                 # Kimi K3 Nano bare-metal CUDA harness
+│   ├── k3_nano_harness.cu   # Full transformer: Delta Attn + LatentMoE + WMMA FP16 + Speculative
+│   ├── build.rs             # Rust nvcc build
+│   ├── Cargo.toml           # Rust crate with Tokio async daemon
+│   ├── Makefile             # make all / make draft / make spec
+│   ├── src/
+│   │   ├── lib.rs           # Re-exports
+│   │   ├── ffi.rs           # C FFI bindings (k3_engine_init/forward/free)
+│   │   └── daemon.rs        # Tokio channel actor (pinned CUDA thread)
+│   └── scripts/
+│       └── create_draft_model.py  # Generate draft.bin for speculative decoding
 └── README.md
+```
+
+---
+
+## Kimi K3 Nano (Bare-Metal CUDA)
+
+Single-file CUDA inference harness with Kimi K3 primitives. No frameworks. No Python runtime. Just nvcc.
+
+```mermaid
+flowchart TD
+    A["Token + Position Embedding"] --> B["RMSNorm"]
+    B --> C["QKV Projection"]
+    C --> D["Delta Attention<br/>tanh(Q * ΔK * scale) * V"]
+    D --> E["Residual Add"]
+    E --> F["RMSNorm"]
+    F --> G["LatentMoE Router<br/>Top-K, low-rank"]
+    G --> H["WMMA FP16 Tensor Core MoE<br/>SiLU + expert routing"]
+    H --> I["Residual Add"]
+    I --> J["Final RMSNorm"]
+    J --> K["Output Head"]
+    K --> L["Top-P Sampling"]
+
+    style D fill:#d97706,stroke:#b45309,color:#fff
+    style H fill:#2563eb,stroke:#1d4ed8,color:#fff
+```
+
+### Compile & Run
+
+```bash
+cd k3_nano
+
+# Build (sm_86 for RTX 3080)
+make all
+
+# Run inference
+./k3_nano ../model.bin "Hello world" 128 0.8 0.9
+
+# Generate draft model for speculative decoding
+make draft
+
+# Run with speculative decoding (gamma=4 draft tokens)
+make spec
+# or manually:
+./k3_nano ../model.bin "Hello world" 128 0.8 0.9 --speculative draft.bin 4
+```
+
+### Features
+
+| Feature | Kernel | Precision |
+|---------|--------|-----------|
+| Delta Attention | `kimi_delta_attention_kernel` | FP32 |
+| LatentMoE Router | `latent_moe_router_kernel` | FP32 |
+| Warp Decode MoE | `warp_decode_moe_kernel` | FP32 |
+| WMMA Tensor Core MoE | `wmma_decode_moe_kernel` | FP16 (sm_86) |
+| Speculative Decoding | `speculative_acceptance_kernel` | FP32 |
+| Draft Model | 1-layer dense FFN | FP32 |
+| INT8 Storage | On-the-fly dequant to FP16 | INT8 → FP16 |
+
+### Rust FFI Bridge
+
+```rust
+use k3_nano::daemon::K3DaemonHandle;
+
+let daemon = K3DaemonHandle::spawn("model.bin", 32000);
+let logits = daemon.predict(token, pos).await?;
+let next_token = logits.iter().enumerate().max_by(|a,b| a.1.partial_cmp(b.1)).unwrap().0;
+```
+
+The daemon pins CUDA to a dedicated OS thread via Tokio mpsc channel actor. No thread-migration errors.
+
+### Binary Format
+
+**Target (K3M1)**:
+```
+Header: magic("K3M1") version dim n_layers n_experts top_k vocab max_seq inter tied pad
+Tensors: token_emb, pos_emb, ln_f, output_weight,
+         per-layer: attn_ln, qkv, attn_out, moe_ln, router, w1, w2
+```
+
+**Draft (K3D1)**:
+```
+Header: magic("K3D1") version K3Config{dim, layers, inter, ...}
+Tensors: ln_f, output_weight,
+         per-layer: attn_ln, qkv, attn_out, ffn_ln, w1, w2 (dense, no MoE)
 ```
 
 ---
