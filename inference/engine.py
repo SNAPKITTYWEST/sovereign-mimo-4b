@@ -1,25 +1,24 @@
 """
-inference/engine.py — Sovereign MiMo-4B Inference Engine
+inference/engine.py — Sovereign MiMo-4B Instruct Engine
 
-FSM + ERE gates pattern from DEVFLOW-FINANCE + bert-agent.
+FSM + ERE gates pattern for instruction-following inference.
 
 States:
   IDLE         — awaiting input
   PREFLIGHT    — three-pillar validation (SEAL, CHAIN, IDENTITY)
-  REASONING    — model forward pass
-  SCORING      — reward head scoring
+  REASONING    — model forward pass + generation
   SEALING      — BLAKE3 attestation + WORM chain
-  RESPONDING   — return gated verdict
+  RESPONDING   — return generated text
   HALTED       — ERE gate failure, no output
 
-Every score passes ERE P1-P5 before leaving the system.
+Every output passes ERE P1-P5 before leaving the system.
 Every decision is sealed to a WORM chain.
 
 Usage:
     from inference.engine import InferenceEngine
-    engine = InferenceEngine("checkpoints/mimo-4b-pruned.pt")
-    result = engine.score("def add(a, b): return a + b")
-    print(result)
+    engine = InferenceEngine("checkpoints/mimo-4b-instruct.pt")
+    result = engine.generate("Write a Python function to compute fibonacci numbers")
+    print(result.text)
 """
 
 from __future__ import annotations
@@ -35,19 +34,15 @@ from typing import Optional
 
 import torch
 
-# ── FSM States ────────────────────────────────────────────────────────────────
 
 class EngineState(Enum):
     IDLE = "idle"
     PREFLIGHT = "preflight"
     REASONING = "reasoning"
-    SCORING = "scoring"
     SEALING = "sealing"
     RESPONDING = "responding"
     HALTED = "halted"
 
-
-# ── ERE Gate Protocol ────────────────────────────────────────────────────────
 
 @dataclass
 class EREGateResult:
@@ -61,18 +56,8 @@ class EREGateResult:
 
 
 def ere_check(agent_id: str, intent: str, output: str) -> EREGateResult:
-    """
-    Five-gate ERE protocol from bert-agent.
-
-    P1: No secrets in output
-    P2: No eval/code injection
-    P3: Loop safety
-    P4: No telemetry beacons
-    P5: SHA-256 audit seal
-    """
     violations = []
 
-    # P1: No secrets (API keys, tokens, passwords)
     secret_patterns = [
         r"sk[-_]", r"api[-_]?key", r"token\s*[:=]", r"password\s*[:=]",
         r"secret\s*[:=]", r"bearer\s+", r"authorization:\s*",
@@ -82,7 +67,6 @@ def ere_check(agent_id: str, intent: str, output: str) -> EREGateResult:
             violations.append(f"P1: secret pattern detected: {pat}")
             break
 
-    # P2: No eval/code injection
     injection_patterns = [
         r"eval\s*\(", r"exec\s*\(", r"__import__", r"subprocess",
         r"os\.system", r"shell=True", r"rm\s+-rf",
@@ -92,7 +76,6 @@ def ere_check(agent_id: str, intent: str, output: str) -> EREGateResult:
             violations.append(f"P2: injection pattern detected: {pat}")
             break
 
-    # P3: Loop safety (no infinite loops without exit)
     loop_patterns = [
         r"while\s+True(?!\s*:.*?break)",
         r"for\s+.*\s+in\s+range\s*\(\s*float\s*\('inf'\)\s*\)",
@@ -102,7 +85,6 @@ def ere_check(agent_id: str, intent: str, output: str) -> EREGateResult:
             violations.append(f"P3: unsafe loop detected: {pat}")
             break
 
-    # P4: No telemetry beacons
     telemetry_patterns = [
         r"fetch\s*\(", r"XMLHttpRequest", r"navigator\.sendBeacon",
         r"analytics\.", r"telemetry\.",
@@ -112,7 +94,6 @@ def ere_check(agent_id: str, intent: str, output: str) -> EREGateResult:
             violations.append(f"P4: telemetry beacon detected: {pat}")
             break
 
-    # P5: SHA-256 seal
     seal_payload = f"{agent_id}:{intent}:{output}"
     seal = hashlib.sha256(seal_payload.encode()).hexdigest()
 
@@ -129,51 +110,13 @@ def ere_check(agent_id: str, intent: str, output: str) -> EREGateResult:
     )
 
 
-# ── QRA Deterministic Routing (H=0) ─────────────────────────────────────────
-
-# Cherry-picked from sovereign-qra/lean/HK_DSL_Formalized_v2026.lean
-# Tripartite 6=6=6: QLG=SLA=QRA, H=0 replaces softmax, T≤36 JWT
-# QRA_TENSOR is 6×6 deterministic routing, zero entropy
-QRA_TENSOR = [
-    [1, 0, 0, 0, 0, 0],
-    [0, 1, 0, 0, 0, 0],
-    [0, 0, 1, 0, 0, 0],
-    [0, 0, 0, 1, 0, 0],
-    [0, 0, 0, 0, 1, 0],
-    [0, 0, 0, 0, 0, 1],
-]  # Identity = deterministic self-route; real QRA uses qlg_to_qra = id bijection
-
-def qra_route(hidden_state: torch.Tensor, num_experts: int = 6) -> int:
-    """
-    Deterministic QRA routing: replaces softmax gate.
-
-    Before (softmax, H>0):
-        logits = gate(hidden_state)  # [num_experts]
-        route = softmax(logits).argmax()
-
-    After (QRA, H=0):
-        route = QRA_TENSOR[expert_id]  # deterministic, no matmul, no dropping
-        # 6×6 table lookup, zero entropy, perfect load balance
-    """
-    # QLG integer sphere solutions map to expert IDs via id bijection
-    # hidden_state norm determines QLG point, QRA tensor gives route
-    # For now: deterministic hash of hidden_state → expert
-    h = hashlib.sha256(hidden_state.detach().cpu().numpy().tobytes()).hexdigest()
-    expert_id = int(h, 16) % num_experts
-    # QRA lookup: deterministic, H=0
-    route = QRA_TENSOR[expert_id][expert_id]  # always 1 = self-route
-    return expert_id
-
-
-# ── WORM Chain ────────────────────────────────────────────────────────────────
-
 @dataclass
 class WORMEntry:
     seq: int
     timestamp: str
     agent_id: str
     intent: str
-    score: float
+    output_hash: str
     verdict: str
     hash_prev: str
     hash_self: str
@@ -181,58 +124,33 @@ class WORMEntry:
 
 
 class WORMChain:
-    """Append-only audit chain. Every entry links to previous hash."""
-
     def __init__(self):
         self.entries: list[WORMEntry] = []
         self.last_hash = "genesis"
 
-    def append(
-        self,
-        agent_id: str,
-        intent: str,
-        score: float,
-        verdict: str,
-        ere_seal: str,
-    ) -> WORMEntry:
+    def append(self, agent_id: str, intent: str, output_hash: str, verdict: str, ere_seal: str) -> WORMEntry:
         seq = len(self.entries)
         timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-        # Hash chain
-        payload = f"{seq}:{timestamp}:{agent_id}:{intent}:{score}:{verdict}:{self.last_hash}"
+        payload = f"{seq}:{timestamp}:{agent_id}:{intent}:{output_hash}:{verdict}:{self.last_hash}"
         hash_self = hashlib.sha256(payload.encode()).hexdigest()
-
-        entry = WORMEntry(
-            seq=seq,
-            timestamp=timestamp,
-            agent_id=agent_id,
-            intent=intent,
-            score=score,
-            verdict=verdict,
-            hash_prev=self.last_hash,
-            hash_self=hash_self,
-            ere_seal=ere_seal,
-        )
-
+        entry = WORMEntry(seq=seq, timestamp=timestamp, agent_id=agent_id, intent=intent,
+                          output_hash=output_hash, verdict=verdict, hash_prev=self.last_hash,
+                          hash_self=hash_self, ere_seal=ere_seal)
         self.entries.append(entry)
         self.last_hash = hash_self
         return entry
 
     def verify(self) -> bool:
-        """Verify chain integrity — every link must hash correctly."""
         prev = "genesis"
         for entry in self.entries:
             if entry.hash_prev != prev:
                 return False
-            payload = f"{entry.seq}:{entry.timestamp}:{entry.agent_id}:{entry.intent}:{entry.score}:{entry.verdict}:{entry.hash_prev}"
-            expected = hashlib.sha256(payload.encode()).hexdigest()
-            if entry.hash_self != expected:
+            payload = f"{entry.seq}:{entry.timestamp}:{entry.agent_id}:{entry.intent}:{entry.output_hash}:{entry.verdict}:{entry.hash_prev}"
+            if entry.hash_self != hashlib.sha256(payload.encode()).hexdigest():
                 return False
             prev = entry.hash_self
         return True
 
-
-# ── Three-Pillar Preflight ───────────────────────────────────────────────────
 
 @dataclass
 class PreflightResult:
@@ -243,25 +161,10 @@ class PreflightResult:
     errors: list[str] = field(default_factory=list)
 
 
-def preflight_check(
-    input_text: str,
-    agent_id: str = "mimo-4b-reward",
-    expected_agent: str = "mimo-4b-reward",
-) -> PreflightResult:
-    """
-    Three-pillar preflight from DEVFLOW-FINANCE.
-
-    P1: SEAL — nonce computed and validated
-    P2: CHAIN — payload integrity (no nulls, no tampering)
-    P3: IDENTITY — agent verified against registry
-    """
+def preflight_check(input_text: str, agent_id: str = "mimo-4b-instruct", expected_agent: str = "mimo-4b-instruct") -> PreflightResult:
     errors = []
-
-    # P1: SEAL — deterministic nonce from input
     nonce = hashlib.sha256(f"{agent_id}:{input_text[:80]}".encode()).hexdigest()[:16]
     seal_valid = len(nonce) == 16 and all(c in "0123456789abcdef" for c in nonce)
-
-    # P2: CHAIN — no null bytes, no empty input
     chain_valid = True
     if not input_text or len(input_text.strip()) == 0:
         errors.append("P2: empty input")
@@ -269,68 +172,52 @@ def preflight_check(
     if "\x00" in input_text:
         errors.append("P2: null byte in input")
         chain_valid = False
-
-    # P3: IDENTITY — agent must be registered
     identity_valid = agent_id == expected_agent
     if not identity_valid:
         errors.append(f"P3: agent '{agent_id}' not in registry")
-
     passed = seal_valid and chain_valid and identity_valid
+    return PreflightResult(passed=passed, seal_valid=seal_valid, chain_valid=chain_valid,
+                           identity_valid=identity_valid, errors=errors)
 
-    return PreflightResult(
-        passed=passed,
-        seal_valid=seal_valid,
-        chain_valid=chain_valid,
-        identity_valid=identity_valid,
-        errors=errors,
-    )
-
-
-# ── Inference Engine ──────────────────────────────────────────────────────────
 
 @dataclass
-class ScoreResult:
-    score: float
-    verdict: str
+class GenerateResult:
+    text: str
     hash: str
     ere_seal: str
     ere_gates: dict
     worm_seq: int
     latency_ms: float
     state: str
+    tokens_generated: int
 
 
 class InferenceEngine:
     """
-    Sovereign MiMo-4B inference engine with FSM + ERE gates.
+    Sovereign MiMo-4B Instruct inference engine with FSM + ERE gates.
 
-    Flow: IDLE → PREFLIGHT → REASONING → SCORING → SEALING → RESPONDING
-    Or:   IDLE → PREFLIGHT → HALTED (if preflight fails)
-    Or:   SCORING → HALTED (if ERE gates fail)
+    Flow: IDLE -> PREFLIGHT -> REASONING -> SEALING -> RESPONDING
     """
 
     def __init__(
         self,
-        checkpoint_path: str = "checkpoints/mimo-4b-pruned.pt",
+        checkpoint_path: str = "checkpoints/mimo-4b-instruct.pt",
         device: str = "auto",
-        agent_id: str = "mimo-4b-reward",
+        agent_id: str = "mimo-4b-instruct",
     ):
         self.agent_id = agent_id
         self.state = EngineState.IDLE
         self.worm = WORMChain()
 
-        # Load model
         if device == "auto":
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
         else:
             self.device = device
 
-        print(f"[ENGINE] Loading model from {checkpoint_path}")
+        print(f"[ENGINE] Loading instruct model from {checkpoint_path}")
         print(f"[ENGINE] Device: {self.device}")
 
-        # Import model
-        from model.reward import SovereignMiMo4B, ModelConfig
-
+        from model.instruct import SovereignMiMo4B, ModelConfig
         self.config = ModelConfig()
         self.model = SovereignMiMo4B(self.config)
 
@@ -340,202 +227,121 @@ class InferenceEngine:
             print(f"[ENGINE] Checkpoint loaded: {checkpoint_path}")
 
         self.model = self.model.to(self.device).eval()
-
-        # Load tokenizer (InstructBERT)
         self._load_tokenizer()
-
-        print("[ENGINE] Ready.")
+        print("[ENGINE] Instruct model ready.")
 
     def _load_tokenizer(self):
-        """Load InstructBERT tokenizer."""
         try:
             from transformers import AutoTokenizer
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                "sentence-transformers/all-MiniLM-L6-v2"
-            )
-            print("[ENGINE] Tokenizer loaded: all-MiniLM-L6-v2 (InstructBERT-compatible)")
+            self.tokenizer = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
         except Exception:
-            # Fallback: simple char-level tokenizer
-            print("[ENGINE] WARNING: Using fallback tokenizer")
             self.tokenizer = None
 
     def tokenize(self, text: str) -> torch.Tensor:
-        """Tokenize text for the model."""
         if self.tokenizer is not None:
-            encoded = self.tokenizer(
-                text,
-                max_length=self.config.max_seq_len,
-                padding="max_length",
-                truncation=True,
-                return_tensors="pt",
-            )
+            encoded = self.tokenizer(text, max_length=self.config.max_seq_len, padding="max_length",
+                                     truncation=True, return_tensors="pt")
             return encoded["input_ids"].to(self.device)
         else:
-            # Fallback: truncate to max_seq_len
             tokens = [ord(c) % self.config.vocab_size for c in text[:self.config.max_seq_len]]
             tokens = tokens + [0] * (self.config.max_seq_len - len(tokens))
             return torch.tensor([tokens], dtype=torch.long, device=self.device)
 
-    def score(self, text: str) -> ScoreResult:
-        """
-        Score a code/text snippet through the full sovereign pipeline.
-
-        FSM: IDLE → PREFLIGHT → REASONING → SCORING → SEALING → RESPONDING
-        """
+    def generate(
+        self,
+        prompt: str,
+        max_new_tokens: int = 512,
+        temperature: float = 0.7,
+        top_k: int = 50,
+        top_p: float = 0.9,
+        system: str = "You are Sovereign MiMo-4B, a sovereign instruct model.",
+    ) -> GenerateResult:
         start = time.time()
 
-        # ── PREFLIGHT ─────────────────────────────────────────────────────
+        # PREFLIGHT
         self.state = EngineState.PREFLIGHT
-        pf = preflight_check(text, self.agent_id)
+        pf = preflight_check(prompt, self.agent_id)
         if not pf.passed:
             self.state = EngineState.HALTED
-            return ScoreResult(
-                score=0.0,
-                verdict="HALTED",
-                hash="",
-                ere_seal="",
-                ere_gates={"P1": False, "P2": False, "P3": False, "P4": False, "P5": False},
-                worm_seq=self.worm.last_hash,
-                latency_ms=(time.time() - start) * 1000,
-                state="halted",
+            return GenerateResult(text="", hash="", ere_seal="", ere_gates={},
+                                  worm_seq=0, latency_ms=0, state="halted", tokens_generated=0)
+
+        # REASONING
+        self.state = EngineState.REASONING
+        full_prompt = f"{system}\n\n{prompt}"
+        input_ids = self.tokenize(full_prompt)
+
+        with torch.no_grad():
+            output_ids = self.model.generate(
+                input_ids,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
             )
 
-        # ── REASONING (QRA deterministic routing, H=0) ───────────────────
-        self.state = EngineState.REASONING
-        input_ids = self.tokenize(text)
-        # QRA replaces softmax MoE gate — deterministic 6×6, no entropy
-        # hidden_state placeholder: use input_ids hash for routing decision
-        qra_expert = qra_route(input_ids.float(), num_experts=6)
+        # Decode only the generated portion
+        generated_ids = output_ids[:, input_ids.shape[1]:]
+        if self.tokenizer is not None:
+            text = self.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+        else:
+            text = "".join(chr(t % 128) for t in generated_ids[0].tolist())
 
-        # ── SCORING ───────────────────────────────────────────────────────
-        self.state = EngineState.SCORING
-        with torch.no_grad():
-            reward = self.model.score(input_ids)
-        score = reward.item()
+        tokens_generated = generated_ids.shape[1]
 
-        # ── ERE GATE CHECK ────────────────────────────────────────────────
-        verdict_text = f"score={score:.4f}"
-        ere = ere_check(
-            agent_id=self.agent_id,
-            intent=f"reward:{text[:80]}",
-            output=verdict_text,
-        )
-
+        # ERE GATE CHECK
+        ere = ere_check(agent_id=self.agent_id, intent=f"instruct:{prompt[:80]}", output=text)
         if not ere.passed:
             self.state = EngineState.HALTED
-            return ScoreResult(
-                score=0.0,
-                verdict="ERE_HALT",
-                hash="",
-                ere_seal="",
-                ere_gates={
-                    "P1": ere.p1_secrets,
-                    "P2": ere.p2_injection,
-                    "P3": ere.p3_loop,
-                    "P4": ere.p4_telemetry,
-                    "P5": False,
-                },
-                worm_seq=self.worm.last_hash,
-                latency_ms=(time.time() - start) * 1000,
-                state="halted",
-            )
+            return GenerateResult(text="", hash="", ere_seal="", ere_gates={},
+                                  worm_seq=0, latency_ms=(time.time() - start) * 1000,
+                                  state="ere_halt", tokens_generated=0)
 
-        # ── SEALING ───────────────────────────────────────────────────────
+        # SEALING
         self.state = EngineState.SEALING
+        output_hash = hashlib.sha256(text.encode()).hexdigest()
+        entry = self.worm.append(agent_id=self.agent_id, intent=f"instruct:{prompt[:80]}",
+                                 output_hash=output_hash, verdict="GENERATED", ere_seal=ere.p5_seal)
 
-        # Classify verdict
-        if score >= 0.8:
-            verdict = "EXCELLENT"
-        elif score >= 0.6:
-            verdict = "GOOD"
-        elif score >= 0.4:
-            verdict = "ACCEPTABLE"
-        elif score >= 0.2:
-            verdict = "POOR"
-        else:
-            verdict = "REJECT"
-
-        # BLAKE3-style hash (using SHA-256 as stand-in)
-        hash_payload = f"{self.agent_id}:{text[:128]}:{score}:{verdict}"
-        hash_val = hashlib.sha256(hash_payload.encode()).hexdigest()
-
-        # WORM chain entry
-        entry = self.worm.append(
-            agent_id=self.agent_id,
-            intent=f"reward:{text[:80]}",
-            score=score,
-            verdict=verdict,
-            ere_seal=ere.p5_seal,
-        )
-
-        # ── RESPONDING ────────────────────────────────────────────────────
+        # RESPONDING
         self.state = EngineState.RESPONDING
         latency = (time.time() - start) * 1000
-
-        result = ScoreResult(
-            score=score,
-            verdict=verdict,
-            hash=hash_val,
-            ere_seal=ere.p5_seal,
-            ere_gates={
-                "P1": ere.p1_secrets,
-                "P2": ere.p2_injection,
-                "P3": ere.p3_loop,
-                "P4": ere.p4_telemetry,
-                "P5": True,
-            },
-            worm_seq=entry.seq,
-            latency_ms=latency,
-            state="complete",
+        result = GenerateResult(
+            text=text, hash=output_hash, ere_seal=ere.p5_seal,
+            ere_gates={"P1": ere.p1_secrets, "P2": ere.p2_injection, "P3": ere.p3_loop,
+                       "P4": ere.p4_telemetry, "P5": True},
+            worm_seq=entry.seq, latency_ms=latency, state="complete", tokens_generated=tokens_generated,
         )
-
         self.state = EngineState.IDLE
         return result
 
-    def score_batch(self, texts: list[str]) -> list[ScoreResult]:
-        """Score multiple texts through the sovereign pipeline."""
-        return [self.score(text) for text in texts]
-
     def verify_chain(self) -> bool:
-        """Verify WORM chain integrity."""
         return self.worm.verify()
 
     def chain_length(self) -> int:
-        """Number of sealed entries in WORM chain."""
         return len(self.worm.entries)
 
 
-# ── CLI ───────────────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
-    import os
     import sys
-
-    # Add parent dir to path
     sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-    engine = InferenceEngine(
-        checkpoint_path="checkpoints/mimo-4b-pruned.pt",
-        device="cpu",
-    )
+    engine = InferenceEngine(checkpoint_path="checkpoints/mimo-4b-instruct.pt", device="cpu")
 
-    # Test scoring
     test_cases = [
-        "def add(a, b): return a + b",
-        "def fib(n): return n if n < 2 else fib(n-1) + fib(n-2)",
-        "import os; os.system('rm -rf /')",
-        "SELECT * FROM users WHERE password = 'admin'",
+        "Write a Python function to compute fibonacci numbers",
+        "Explain what a hash table is",
+        "Write a Rust function that reverses a string",
     ]
 
-    for code in test_cases:
-        result = engine.score(code)
+    for prompt in test_cases:
+        result = engine.generate(prompt)
         print(f"\n{'='*60}")
-        print(f"Code: {code[:60]}...")
-        print(f"Score: {result.score:.4f}")
-        print(f"Verdict: {result.verdict}")
-        print(f"Hash: {result.hash[:16]}...")
-        print(f"ERE Gates: {result.ere_gates}")
+        print(f"Prompt: {prompt}")
+        print(f"Response: {result.text[:200]}...")
+        print(f"Tokens: {result.tokens_generated}")
         print(f"Latency: {result.latency_ms:.1f}ms")
+        print(f"ERE Gates: {result.ere_gates}")
         print(f"Chain valid: {engine.verify_chain()}")
 
     print(f"\n[ENGINE] Total chain entries: {engine.chain_length()}")

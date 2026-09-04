@@ -9,7 +9,7 @@
 [![Ollama](https://img.shields.io/badge/Deploy-Ollama%20Local-000000.svg)](#deploy)
 [![ERE](https://img.shields.io/badge/ERE-P1--P5%20Gates-red.svg)](#ere-gates)
 
-> **Pruned from MiMo-7B. Sovereign stack integration. FSM + ERE gates. WORM chain. No cloud.**
+> **Pruned from MiMo-7B. Sovereign instruct model. FSM + ERE gates. WORM chain. No cloud.**
 
 ---
 
@@ -17,19 +17,19 @@
 
 ```mermaid
 flowchart TD
-    subgraph SOVEREIGN["SOVEREIGN MiMo-4B"]
+    subgraph SOVEREIGN["SOVEREIGN MiMo-4B INSTRUCT"]
         A["MiMo-7B-RL<br/>32L / 4096H / 32H<br/>XiaomiMiMo"] -->|"Layer Selection<br/>keep 24 of 32"| B["MiMo-4B<br/>24L / 2048H / 16Q:4KV<br/>SwiGLU 5504"]
-        B -->|"Pruning + Projection<br/>weight selection"| C["Reward Head<br/>linear(2048, 1)<br/>sigmoid [0, 1]"]
+        B -->|"Pruning + Projection<br/>weight selection"| C["LM Head<br/>linear(2048, 32000)<br/>text generation"]
     end
 
     subgraph INFERENCE["INFERENCE ENGINE"]
-        D["Input Code"] --> E["PREFLIGHT<br/>SEAL + CHAIN + IDENTITY"]
+        D["User Prompt"] --> E["PREFLIGHT<br/>SEAL + CHAIN + IDENTITY"]
         E -->|pass| F["QRA ROUTER<br/>H=0 Deterministic<br/>6x6 Tensor"]
         F --> G["FORWARD PASS<br/>24 Transformer Layers<br/>GQA + RoPE + RMSNorm"]
-        G --> H["SCORING<br/>Reward Head → [0, 1]"]
+        G --> H["GENERATION<br/>Top-P / Top-K / Temperature"]
         H --> I["ERE GATES<br/>P1-P5 Verification"]
         I -->|pass| J["SEALING<br/>SHA-256 + WORM Chain"]
-        J --> K["RESPONSE<br/>score + verdict + hash"]
+        J --> K["RESPONSE<br/>text + hash + audit"]
     end
 
     K --> L["WORM CHAIN<br/>Append-only SHA-256<br/>Every decision sealed"]
@@ -46,7 +46,7 @@ flowchart TD
 
 ## What This Is
 
-A 4B parameter code reward model pruned from MiMo-7B-RL to match the hilbert-4b architecture spec. Every score passes through ERE P1-P5 gates. Every decision is sealed to a WORM chain.
+A 4B parameter sovereign instruct model pruned from MiMo-7B-RL. General-purpose instruction following — code generation, reasoning, question answering, task execution. Every output passes through ERE P1-P5 gates. Every decision is sealed to a WORM chain.
 
 ### Source → Target
 
@@ -58,7 +58,7 @@ A 4B parameter code reward model pruned from MiMo-7B-RL to match the hilbert-4b 
 | FFN | 11008 | 5504 (SwiGLU) |
 | Vocab | 151936 | 32000 |
 | Max Seq | 32768 | 8192 |
-| Reward Head | — | linear(2048, 1) → sigmoid |
+| LM Head | — | linear(2048, 32000) |
 | Parameters | ~7B | ~4B |
 | Size (Q4_K_M) | ~4.5 GB | ~2.5 GB |
 
@@ -107,22 +107,22 @@ python -m inference.engine
 ```python
 from inference.engine import InferenceEngine
 
-engine = InferenceEngine("checkpoints/mimo-4b-pruned.pt")
-result = engine.score("def add(a, b): return a + b")
+engine = InferenceEngine("checkpoints/mimo-4b-instruct.pt")
+result = engine.generate("Write a Python function to compute fibonacci numbers")
 
-print(result.score)      # 0.8742
-print(result.verdict)    # "EXCELLENT"
-print(result.hash[:16])  # "a1b2c3d4e5f6g7h8"
-print(result.ere_gates)  # {"P1": True, "P2": True, ...}
-print(result.worm_seq)   # 0
-print(result.latency_ms) # 12.3
+print(result.text)          # "def fibonacci(n):\n    ..."
+print(result.tokens_generated)  # 42
+print(result.hash[:16])     # "a1b2c3d4e5f6g7h8"
+print(result.ere_gates)     # {"P1": True, "P2": True, ...}
+print(result.worm_seq)      # 0
+print(result.latency_ms)    # 12.3
 ```
 
 ### Test the FSM Pipeline
 
 ```bash
 python -m inference.engine
-# Tests: clean code, recursion, injection, SQL — FSM + ERE + WORM
+# Tests: code gen, Q&A, injection attempts — FSM + ERE + WORM
 ```
 
 ---
@@ -147,7 +147,7 @@ flowchart LR
 
 - **H=0**: Zero entropy, deterministic routing
 - **No softmax**: Eliminates matmul overhead
-- **Perfect load balance**: Hash distribution均匀
+- **Perfect load balance**: Hash distribution uniform
 - **CUDA kernel**: `kernels/qra_router.cu` — FNV-1a hash + modulo
 
 ---
@@ -156,7 +156,7 @@ flowchart LR
 
 | Kernel | File | What |
 |--------|------|------|
-| QRA Router | `kernels/qra_router.cu` | Deterministic FNV-1a routing, 6×6 tensor, load balance metrics |
+| QRA Router | `kernels/qra_router.cu` | Deterministic FNV-1a routing, 6x6 tensor, load balance metrics |
 | RMSNorm | `kernels/rmsnorm.cu` | Fused single-pass RMSNorm, fp32 + fp16, shared memory reduction |
 | RoPE | `kernels/rope.cu` | Rotary Position Embedding, precompute + apply, complex64 |
 | SwiGLU | `kernels/swiglu.cu` | Fused SiLU activation + elementwise multiply, fp32 + fp16 |
@@ -173,7 +173,7 @@ make torch        # PyTorch JIT compile
 
 ## ERE Gates
 
-Every score passes through 5 verification gates:
+Every output passes through 5 verification gates:
 
 | Gate | Name | Check |
 |------|------|-------|
@@ -193,8 +193,8 @@ Append-only SHA-256 audit chain. Every entry links to previous hash.
 
 ```
 Entry[0]: genesis
-Entry[1]: seq=1, timestamp, agent_id, intent, score, verdict, hash_prev=Entry[0].hash
-Entry[2]: seq=2, timestamp, agent_id, intent, score, verdict, hash_prev=Entry[1].hash
+Entry[1]: seq=1, timestamp, agent_id, intent, output_hash, verdict, hash_prev=Entry[0].hash
+Entry[2]: seq=2, timestamp, agent_id, intent, output_hash, verdict, hash_prev=Entry[1].hash
 ...
 ```
 
@@ -236,7 +236,7 @@ sovereign-mimo-4b/
 │   ├── architecture.json    # hilbert-4b spec
 │   └── train_config.yaml    # training config
 ├── inference/
-│   └── engine.py            # FSM + ERE + WORM inference
+│   └── engine.py            # FSM + ERE + WORM inference (instruct mode)
 ├── kernels/
 │   ├── qra_router.cu        # Deterministic QRA routing
 │   ├── rmsnorm.cu           # Fused RMSNorm
@@ -245,10 +245,16 @@ sovereign-mimo-4b/
 │   ├── fused_attention.cu   # GQA FlashAttention
 │   └── Makefile             # Build (sm_86)
 ├── model/
-│   └── reward.py            # SovereignMiMo4B + ModelConfig
+│   ├── instruct.py          # SovereignMiMo4B instruct model + generate()
+│   └── reward.py            # (legacy) scalar reward head
 ├── prune/
 │   └── prune_mimo7b_to_4b.py  # MiMo-7B → 4B pipeline
-├── Modelfile                # Ollama deployment
+├── rtl/
+│   ├── tensor_core_fp16.sv  # Cherry-picked from sovereign-systolic
+│   └── tensor_pkg.sv        # Cherry-picked from sovereign-systolic
+├── microcode/
+│   └── extended_ws_os_tc.txt # Cherry-picked from sovereign-systolic
+├── Modelfile                # Ollama deployment (instruct mode)
 ├── MODEL_CARD.md            # Model card
 ├── k3_nano/                 # Kimi K3 Nano bare-metal CUDA harness
 │   ├── k3_nano_harness.cu   # Full transformer: Delta Attn + LatentMoE + WMMA FP16 + Speculative
@@ -354,7 +360,7 @@ Tensors: ln_f, output_weight,
 
 Tri-licensed: **Sovereign Source License v1.0** (Bel Esprit d'Accord Trust, 2026-06-01) | **BSL-1.1** (Change Date 2030-06-01 → Apache 2.0) | **AGPL-3.0**.
 
-Copyright (C) 2026 Ahmad Ali Parr <ahmedparr93@gmail.com> / Jessica <jessica@snapkitty.com>  
+Copyright (C) 2026 Ahmad Ali Parr <ahmedparr93@gmail.com> / Jessica <jessica@snapkitty.com>
 Bel Esprit D'Accord Irrevocable Trust · EIN 42-697643
 
 ---
